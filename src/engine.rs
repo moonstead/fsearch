@@ -64,6 +64,8 @@ pub struct Status {
     pub overlay: usize,
     pub removed: usize,
     pub event_id: u64,
+    /// Unix seconds when every disk change up to then was applied (0: unknown).
+    pub synced_at: u32,
     pub index_bytes: usize,
     pub content_docs: usize,
     pub content_segments: usize,
@@ -291,6 +293,7 @@ impl Engine {
             overlay: l.as_ref().map_or(0, |l| l.over.len()),
             removed: l.as_ref().map_or(0, |l| l.dead_count),
             event_id: l.as_ref().map_or(0, |l| l.event_id),
+            synced_at: l.as_ref().map_or(0, |l| l.synced_at),
             index_bytes: l.as_ref().map_or(0, |l| l.base.bytes()),
             content_docs: c.docs(),
             content_segments: c.segs.len(),
