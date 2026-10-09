@@ -38,6 +38,9 @@ pub struct Options {
     /// it, the consent-gated folders are skipped, since opening one pops a
     /// privacy prompt and blocks until someone answers it.
     pub skip: Option<Vec<PathBuf>>,
+    /// Keep a content (trigram) index for `grep`. False: name search only,
+    /// and nothing is written under `dir/content`.
+    pub content: bool,
 }
 
 /// One name-search result.
@@ -96,6 +99,9 @@ struct Shared {
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
+    content_enabled: bool,
+    /// `Engine::stop` was called: background loops return.
+    stopped: AtomicBool,
 }
 
 fn try_lock(f: &std::fs::File) -> bool {
@@ -164,7 +170,7 @@ impl Engine {
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
-        let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
+        let content = if owner && opts.content { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
         let shared = Arc::new(Shared {
             live: RwLock::new(None),
             content: RwLock::new(content),
@@ -180,6 +186,8 @@ impl Engine {
             stream: Mutex::new(None),
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
+            content_enabled: opts.content,
+            stopped: AtomicBool::new(false),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
@@ -293,6 +301,16 @@ impl Engine {
         self.s.save_requested.store(true, Ordering::Relaxed);
         let _ = self.s.wake.send(Vec::new());
     }
+
+    /// Stop following the disk and drop the index from memory; the saved
+    /// index stays for the next start. Searches answer `Err` afterwards. A
+    /// first crawl still in progress finishes (and is saved) before the
+    /// background thread exits.
+    pub fn stop(&self) {
+        self.s.stopped.store(true, Ordering::Relaxed);
+        *self.s.stream.lock().unwrap() = None;
+        let _ = self.s.wake.send(Vec::new());
+    }
 }
 
 /// (dirs, trees) for the content worker to re-sync.
@@ -328,7 +346,7 @@ impl Shared {
         let cdir = self.dir.join("content");
         let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
         let mut seen = self.content_seen.lock().unwrap();
-        if changed != *seen {
+        if self.content_enabled && changed != *seen {
             *seen = changed;
             *self.content.write().unwrap() = Content::open_shared(cdir);
         }
@@ -336,6 +354,9 @@ impl Shared {
 }
 
 fn start_content(s: &Arc<Shared>) {
+    if !s.content_enabled {
+        return;
+    }
     let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
     // Reconcile all of home once (cheap when nothing changed), then follow
     // along with the name index's changes.
@@ -354,7 +375,9 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
     }
     s.owner.store(true, Ordering::Relaxed);
     log("took over the index from a previous owner");
-    *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+    if s.content_enabled {
+        *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+    }
     rescan_unskipped(s);
     start_content(s);
     true
@@ -450,6 +473,9 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // one reindex per 5 min instead of one per event batch.
     let mut pending: HashMap<(Vec<u8>, bool), (Instant, Instant)> = HashMap::new();
     loop {
+        if shared.stopped.load(Ordering::Relaxed) {
+            return;
+        }
         let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };
         match rx.recv_timeout(wait) {
             Ok(first) => {
@@ -623,6 +649,12 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         events.extend(rx.try_iter().flatten());
+        if shared.stopped.load(Ordering::Relaxed) {
+            *shared.stream.lock().unwrap() = None;
+            *shared.live.write().unwrap() = None;
+            release_memory();
+            return;
+        }
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));

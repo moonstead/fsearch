@@ -74,7 +74,7 @@ JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or
 Or link the crate:
 
 ```rust
-let engine = fsearch::Engine::start(fsearch::Options { dir: fsearch::default_dir(&home), home: home.clone(), skip: None })?;
+let engine = fsearch::Engine::start(fsearch::Options { dir: fsearch::default_dir(&home), home: home.clone(), skip: None, content: true })?;
 let hits = engine.search(&fsearch::Query::parse("fsearch main", &home)?)?;
 ```
 
