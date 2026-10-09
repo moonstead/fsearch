@@ -23,8 +23,26 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// tracked, i.e. while SKIP is set.
 pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Folder names never to open, wherever they are: exact (`node_modules`),
+/// `prefix*` (`.*`: every hidden folder) or `*suffix` (`*.app`).
+pub static SKIP_NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
+        || SKIP_NAMES.get().is_some_and(|v| path.split(|&b| b == b'/').any(|c| !c.is_empty() && v.iter().any(|n| name_matches(c, n))))
+}
+
+fn name_matches(name: &[u8], pattern: &[u8]) -> bool {
+    match (pattern.strip_suffix(b"*"), pattern.strip_prefix(b"*")) {
+        (Some(prefix), _) => name.starts_with(prefix),
+        (_, Some(suffix)) => name.len() > suffix.len() && name.ends_with(suffix),
+        _ => name == pattern,
+    }
+}
+
+/// Paths are tracked (and checked) only when something is skipped.
+fn tracking() -> bool {
+    SKIP.get().is_some_and(|v| !v.is_empty()) || SKIP_NAMES.get().is_some_and(|v| !v.is_empty())
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -74,7 +92,7 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.
-    let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
+    let path = tracking().then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
@@ -247,4 +265,20 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
     }
     l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
     l.names.extend_from_slice(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_matches;
+
+    #[test]
+    fn skip_name_patterns() {
+        assert!(name_matches(b"node_modules", b"node_modules"));
+        assert!(!name_matches(b"node_modules2", b"node_modules"));
+        assert!(name_matches(b".git", b".*"));
+        assert!(!name_matches(b"git", b".*"));
+        assert!(name_matches(b"Xcode.app", b"*.app"));
+        assert!(!name_matches(b".app", b"*.app"));
+        assert!(!name_matches(b"apps", b"*.app"));
+    }
 }

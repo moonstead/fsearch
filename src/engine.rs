@@ -38,6 +38,8 @@ pub struct Options {
     /// it, the consent-gated folders are skipped, since opening one pops a
     /// privacy prompt and blocks until someone answers it.
     pub skip: Option<Vec<PathBuf>>,
+    /// Folder names never to open, anywhere: exact, `prefix*` or `*suffix`.
+    pub skip_names: Vec<String>,
     /// Keep a content (trigram) index for `grep`. False: name search only,
     /// and nothing is written under `dir/content`.
     pub content: bool,
@@ -166,6 +168,9 @@ impl Engine {
         };
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
+        }
+        if !opts.skip_names.is_empty() {
+            let _ = walk::SKIP_NAMES.set(opts.skip_names.into_iter().map(String::into_bytes).collect());
         }
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();

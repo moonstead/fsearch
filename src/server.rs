@@ -25,7 +25,7 @@ pub fn serve(dir: PathBuf, home: String) {
     }
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
-    let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None, content: true }) {
+    let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None, skip_names: Vec::new(), content: true }) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("{} {e}", fsearch::query::now_secs());
