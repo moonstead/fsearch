@@ -16,7 +16,7 @@ pub const NONE: u32 = u32::MAX;
 /// Folders never to open: set when the daemon runs without Full Disk
 /// Access, where opening a consent-gated folder (Downloads, Desktop, ...)
 /// pops a privacy prompt and blocks the call until someone answers it.
-pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+pub static SKIP: std::sync::RwLock<Vec<Vec<u8>>> = std::sync::RwLock::new(Vec::new());
 
 /// Folders a scan was refused (EPERM): without Full Disk Access macOS also
 /// silently denies some, like ~/Library/Mail. Recorded only while paths are
@@ -25,11 +25,20 @@ pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// Folder names never to open, wherever they are: exact (`node_modules`),
 /// `prefix*` (`.*`: every hidden folder) or `*suffix` (`*.app`).
-pub static SKIP_NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+pub static SKIP_NAMES: std::sync::RwLock<Vec<Vec<u8>>> = std::sync::RwLock::new(Vec::new());
+
+/// Folders always opened, whatever SKIP and SKIP_NAMES say, with the
+/// folders on the way to them.
+pub static KEEP: std::sync::RwLock<Vec<Vec<u8>>> = std::sync::RwLock::new(Vec::new());
+
+fn under(path: &[u8], dir: &[u8]) -> bool {
+    path.starts_with(dir) && (path.len() == dir.len() || path[dir.len()] == b'/' || dir == b"/")
+}
 
 pub fn blocked(path: &[u8]) -> bool {
-    SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
-        || SKIP_NAMES.get().is_some_and(|v| path.split(|&b| b == b'/').any(|c| !c.is_empty() && v.iter().any(|n| name_matches(c, n))))
+    let skipped = SKIP.read().unwrap().iter().any(|s| under(path, s))
+        || SKIP_NAMES.read().unwrap().iter().any(|n| path.split(|&b| b == b'/').any(|c| !c.is_empty() && name_matches(c, n)));
+    skipped && !KEEP.read().unwrap().iter().any(|k| under(path, k) || under(k, path))
 }
 
 fn name_matches(name: &[u8], pattern: &[u8]) -> bool {
@@ -42,7 +51,7 @@ fn name_matches(name: &[u8], pattern: &[u8]) -> bool {
 
 /// Paths are tracked (and checked) only when something is skipped.
 fn tracking() -> bool {
-    SKIP.get().is_some_and(|v| !v.is_empty()) || SKIP_NAMES.get().is_some_and(|v| !v.is_empty())
+    !SKIP.read().unwrap().is_empty() || !SKIP_NAMES.read().unwrap().is_empty()
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -280,5 +289,22 @@ mod tests {
         assert!(name_matches(b"Xcode.app", b"*.app"));
         assert!(!name_matches(b".app", b"*.app"));
         assert!(!name_matches(b"apps", b"*.app"));
+    }
+
+    #[test]
+    fn kept_folders_and_the_way_to_them_are_never_blocked() {
+        *super::SKIP.write().unwrap() = vec![b"/opt".to_vec()];
+        *super::SKIP_NAMES.write().unwrap() = vec![b"build".to_vec()];
+        *super::KEEP.write().unwrap() = vec![b"/opt/tools/share".to_vec(), b"/Users/a/app/build".to_vec()];
+        assert!(super::blocked(b"/opt/other"));
+        assert!(!super::blocked(b"/opt"));
+        assert!(!super::blocked(b"/opt/tools"));
+        assert!(!super::blocked(b"/opt/tools/share/doc"));
+        assert!(!super::blocked(b"/Users/a/app/build/out"));
+        assert!(super::blocked(b"/Users/a/lib/build"));
+        assert!(!super::blocked(b"/Users/a/lib"));
+        *super::SKIP.write().unwrap() = Vec::new();
+        *super::SKIP_NAMES.write().unwrap() = Vec::new();
+        *super::KEEP.write().unwrap() = Vec::new();
     }
 }

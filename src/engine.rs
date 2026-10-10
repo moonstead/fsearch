@@ -40,6 +40,8 @@ pub struct Options {
     pub skip: Option<Vec<PathBuf>>,
     /// Folder names never to open, anywhere: exact, `prefix*` or `*suffix`.
     pub skip_names: Vec<String>,
+    /// Folders always opened despite `skip` and `skip_names`.
+    pub keep: Vec<PathBuf>,
     /// Keep a content (trigram) index for `grep`. False: name search only,
     /// and nothing is written under `dir/content`.
     pub content: bool,
@@ -106,6 +108,8 @@ struct Shared {
     content_enabled: bool,
     /// `Engine::stop` was called: background loops return.
     stopped: AtomicBool,
+    /// `Engine::reconfigure` asked for a fresh crawl.
+    rebuild_requested: AtomicBool,
 }
 
 fn try_lock(f: &std::fs::File) -> bool {
@@ -168,12 +172,7 @@ impl Engine {
                 gated(&opts.home)
             }
         };
-        if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
-        }
-        if !opts.skip_names.is_empty() {
-            let _ = walk::SKIP_NAMES.set(opts.skip_names.into_iter().map(String::into_bytes).collect());
-        }
+        set_skips(skip, opts.skip_names, opts.keep);
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
@@ -195,6 +194,7 @@ impl Engine {
             content_seen: Mutex::new(None),
             content_enabled: opts.content,
             stopped: AtomicBool::new(false),
+            rebuild_requested: AtomicBool::new(false),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
@@ -299,7 +299,7 @@ impl Engine {
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
             content_pending: self.s.content_pending.load(Ordering::Relaxed),
-            full_disk_access: walk::SKIP.get().is_none(),
+            full_disk_access: walk::SKIP.read().unwrap().is_empty(),
             owner: self.s.owner(),
         }
     }
@@ -307,6 +307,14 @@ impl Engine {
     /// Compact and save the name index soon (on the background thread).
     pub fn save(&self) {
         self.s.save_requested.store(true, Ordering::Relaxed);
+        let _ = self.s.wake.send(Vec::new());
+    }
+
+    /// Change what is skipped and kept, then crawl again on the background
+    /// thread; searches answer from the current index meanwhile.
+    pub fn reconfigure(&self, skip: Vec<PathBuf>, skip_names: Vec<String>, keep: Vec<PathBuf>) {
+        set_skips(skip.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(), skip_names, keep);
+        self.s.rebuild_requested.store(true, Ordering::Relaxed);
         let _ = self.s.wake.send(Vec::new());
     }
 
@@ -397,7 +405,7 @@ const SKIPPED: &str = "skipped";
 
 fn note_skipped(dir: &Path) {
     let mut out = Vec::new();
-    for p in walk::SKIP.get().into_iter().flatten().chain(walk::DENIED.lock().unwrap().iter()) {
+    for p in walk::SKIP.read().unwrap().iter().chain(walk::DENIED.lock().unwrap().iter()) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
@@ -559,6 +567,12 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
         }
         release_memory();
     }
+}
+
+fn set_skips(skip: Vec<Vec<u8>>, skip_names: Vec<String>, keep: Vec<PathBuf>) {
+    *walk::SKIP.write().unwrap() = skip;
+    *walk::SKIP_NAMES.write().unwrap() = skip_names.into_iter().map(String::into_bytes).collect();
+    *walk::KEEP.write().unwrap() = keep.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect();
 }
 
 fn full_build(shared: &Shared, event_id: u64) -> Index {
@@ -727,6 +741,14 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             }
         }
         if !shared.owner() {
+            continue;
+        }
+        if shared.rebuild_requested.swap(false, Ordering::Relaxed) {
+            let event_id = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
+            walk::DENIED.lock().unwrap().clear();
+            let idx = full_build(shared, event_id);
+            *shared.live.write().unwrap() = Some(Live::new(idx));
+            last_save = Instant::now();
             continue;
         }
         let (pending, stale) = {
