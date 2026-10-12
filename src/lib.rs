@@ -14,3 +14,8 @@ pub mod walk;
 pub use content::{FileMatches, Grep, GrepResult};
 pub use engine::{Engine, Found, Options, Status, default_dir, gated, has_full_disk_access, no_materialize};
 pub use query::{GrepMode, Query};
+
+/// Tests that set the process-wide skip lists (an engine's start does) take
+/// this first.
+#[cfg(test)]
+pub(crate) static SKIPS_IN_USE: std::sync::Mutex<()> = std::sync::Mutex::new(());

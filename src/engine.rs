@@ -89,7 +89,7 @@ pub struct Engine {
 struct Shared {
     live: RwLock<Option<Live>>,
     /// A saved index is still being read in: searches wait for it rather
-    /// than answer "indexing".
+    /// than answer "indexing". Cleared however the read ends (`LoadDone`).
     loading: (Mutex<bool>, Condvar),
     content: RwLock<Content>,
     home: String,
@@ -220,15 +220,43 @@ impl Engine {
         };
         set_skips(skip, opts.skip_names, opts.keep);
         let dir = opts.dir;
-        // Read a saved index in (Live::new faults its arrays in) while the
-        // rest starts up: opening content and FSEvents take ms, tens from disk.
-        let loading = Index::load(&dir.join("index.bin")).map(|b| {
+        // Read a saved index in (checking its tables, then Live::new faults
+        // its arrays in) while the rest starts up: opening content and
+        // FSEvents take ms, tens from disk. One claiming a future event id
+        // is not from this disk's history.
+        let saved = match Index::map_saved(&dir.join("index.bin")) {
+            Ok(b) if b.event_id <= fsevents::current_id() => Some(b),
+            Ok(_) => {
+                log("saved index is ahead of this disk's events: rebuilding");
+                None
+            }
+            Err("missing") => None,
+            Err(why) => {
+                log(format!("saved index unusable ({why}): rebuilding"));
+                None
+            }
+        };
+        let loading = saved.map(|b| {
             let (n, event_id) = (b.n, b.event_id);
-            (n, event_id, std::thread::spawn(move || Live::new(b)))
+            let read_in = std::thread::spawn(move || match b.check() {
+                #[cfg(test)]
+                Ok(()) if tests::FAIL_READ_IN.load(Ordering::SeqCst) => panic!("injected read-in failure"),
+                Ok(()) => Some(Live::new(b)),
+                Err(why) => {
+                    log(format!("saved index unusable ({why}): rebuilding"));
+                    None
+                }
+            });
+            (n, event_id, read_in)
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
-        let content = if owner && opts.content { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
+        let content = match (opts.content, owner) {
+            (true, true) => Content::open(dir.join("content")),
+            (true, false) => Content::open_shared(dir.join("content")),
+            // Name search only: content files a past run left are not read.
+            (false, _) => Content::none(dir.join("content")),
+        };
         let shared = Arc::new(Shared {
             live: RwLock::new(None),
             loading: (Mutex::new(loading.is_some()), Condvar::new()),
@@ -257,6 +285,7 @@ impl Engine {
             Some((_, event_id, _)) if *event_id != 0 => *event_id,
             _ => fsevents::current_id(),
         };
+        let had_saved = loading.is_some();
         if owner {
             // Watch before scanning so nothing that changes mid-scan is
             // missed; replaying it afterwards is harmless (diffs are idempotent).
@@ -264,26 +293,44 @@ impl Engine {
         }
         let s = shared.clone();
         spawn("fsearch-apply", move || {
-            let live = match loading {
+            // However this start ends (published, stopped, a failed load, a
+            // panic), searches waiting on the saved index wake up.
+            let loaded = LoadDone(&s);
+            let read = match loading {
                 Some((n, event_id, read_in)) => {
                     log(format!("loaded {n} entries, replaying events since {event_id}"));
                     if !owner {
                         s.watch(event_id);
                     }
-                    read_in.join().expect("load index")
+                    read_in.join().unwrap_or_else(|_| {
+                        log("reading in the saved index failed: rebuilding");
+                        None
+                    })
+                }
+                None => None,
+            };
+            let live = match read {
+                Some(live) => live,
+                // A saved index that failed: follow the disk from now, not
+                // from its event id.
+                None if owner && had_saved => {
+                    let now = fsevents::current_id();
+                    s.watch(now);
+                    Live::new(full_build(&s, now))
                 }
                 None if owner => Live::new(full_build(&s, since)),
-                None => {
-                    // The owner is building it; follow once it exists.
-                    let b = wait_for_index(&s.dir);
-                    s.watch(b.event_id);
-                    Live::new(b)
-                }
+                // The owner is building it: follow once it exists, or take
+                // over if the owner goes first.
+                None => match wait_for_index(&s) {
+                    Some(live) => live,
+                    None => return,
+                },
             };
-            *s.live.write().unwrap() = Some(live);
-            *s.loading.0.lock().unwrap() = false;
-            s.loading.1.notify_all();
-            if owner {
+            if !s.publish(live) {
+                return;
+            }
+            drop(loaded);
+            if s.owner() {
                 rescan_unskipped(&s);
                 start_content(&s);
             }
@@ -406,9 +453,14 @@ impl Engine {
     /// first crawl still in progress finishes (and is saved) before the
     /// background thread exits.
     pub fn stop(&self) {
-        self.s.stopped.store(true, Ordering::Relaxed);
+        self.s.stopped.store(true, Ordering::SeqCst);
         *self.s.stream.lock().unwrap() = None;
+        // A saved index still loading is not published (see `publish`):
+        // searches waiting for it answer `Err` now.
+        self.s.end_loading();
         let _ = self.s.wake.send(Vec::new());
+        // The content worker sleeps up to an hour between changes.
+        let _ = self.s.content_tx.send((Vec::new(), Vec::new()));
     }
 }
 
@@ -421,10 +473,38 @@ fn indexing() -> String {
     format!("indexing: {:.1}M entries so far (the first run lists the whole disk, ~25s)", n as f64 / 1e6)
 }
 
+/// Ends the saved index's loading when dropped (see `Shared::loading`).
+struct LoadDone<'a>(&'a Shared);
+
+impl Drop for LoadDone<'_> {
+    fn drop(&mut self) {
+        self.0.end_loading();
+    }
+}
+
 impl Shared {
+    fn end_loading(&self) {
+        let (loading, cv) = &self.loading;
+        *loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        cv.notify_all();
+    }
+
+    /// Make `live` the index searches use, unless the engine was stopped
+    /// (then it is dropped and false returned). Checked under the lock, so
+    /// nothing is published after `stop` returns.
+    fn publish(&self, live: Live) -> bool {
+        let mut g = self.live.write().unwrap();
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        *g = Some(live);
+        true
+    }
+
     fn live(&self) -> RwLockReadGuard<'_, Option<Live>> {
         let (loading, cv) = &self.loading;
-        drop(cv.wait_while(loading.lock().unwrap(), |l| *l).unwrap());
+        let g = loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(cv.wait_while(g, |l| *l).unwrap_or_else(std::sync::PoisonError::into_inner));
         self.live.read().unwrap()
     }
 
@@ -452,7 +532,7 @@ impl Shared {
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
             self.watch(base.event_id);
-            *self.live.write().unwrap() = Some(Live::new(base));
+            self.publish(Live::new(base));
         }
         let cdir = self.dir.join("content");
         let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
@@ -536,10 +616,27 @@ fn rescan_unskipped(shared: &Shared) {
     shared.save_requested.store(true, Ordering::Relaxed);
 }
 
-fn wait_for_index(dir: &Path) -> Index {
+/// A follower before the owner's first save: follow the saved index once
+/// it reads, or take over the lock if the owner went without writing one
+/// (or left one this version cannot read) and build it. None if stopped.
+fn wait_for_index(s: &Arc<Shared>) -> Option<Live> {
     loop {
-        if let Some(b) = Index::load(&dir.join("index.bin")) {
-            return b;
+        if s.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(b) = Index::load(&s.dir.join("index.bin")) {
+            s.watch(b.event_id);
+            return Some(Live::new(b));
+        }
+        if try_lock(&s.lock) {
+            s.owner.store(true, Ordering::Relaxed);
+            log("took over the index from a previous owner that left none: building it");
+            if s.content_enabled {
+                *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+            }
+            let now = fsevents::current_id();
+            s.watch(now);
+            return Some(Live::new(full_build(s, now)));
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -741,7 +838,19 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     release_memory();
     // Re-map from the file so the index is clean, evictable page cache
     // rather than anonymous memory.
-    Index::load(&path).unwrap_or(idx)
+    reload(&path, idx)
+}
+
+/// The index just saved at `path`, mapped from the file; `built` if that
+/// fails (logged: the next start would rebuild).
+fn reload(path: &Path, built: Index) -> Index {
+    match Index::load_checked(path) {
+        Ok(idx) => idx,
+        Err(why) => {
+            log(format!("saved index does not read back ({why})"));
+            built
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -767,9 +876,9 @@ fn compact(shared: &Shared) {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    let idx = Index::load(&path).unwrap_or(idx);
+    let idx = reload(&path, idx);
     let n = idx.n;
-    *shared.live.write().unwrap() = Some(Live::new(idx));
+    shared.publish(Live::new(idx));
     release_memory();
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
 }
@@ -828,9 +937,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         events.extend(rx.try_iter().flatten());
-        if shared.stopped.load(Ordering::Relaxed) {
+        if shared.stopped.load(Ordering::SeqCst) {
             *shared.stream.lock().unwrap() = None;
             *shared.live.write().unwrap() = None;
+            // The spare search buffers the index handed back as it dropped.
+            crate::query::trim_pools();
             release_memory();
             return;
         }
@@ -934,7 +1045,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             let event_id = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
             walk::DENIED.lock().unwrap().clear();
             let idx = full_build(shared, event_id);
-            *shared.live.write().unwrap() = Some(Live::new(idx));
+            shared.publish(Live::new(idx));
             last_save = Instant::now();
             continue;
         }
@@ -954,4 +1065,71 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
 /// Default data dir: `~/Library/Application Support/FSearch`.
 pub fn default_dir(home: &str) -> PathBuf {
     Path::new(home).join("Library/Application Support/FSearch")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Make the next saved index's read-in thread panic.
+    pub(super) static FAIL_READ_IN: AtomicBool = AtomicBool::new(false);
+
+    fn wait(mut ok: impl FnMut() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(20) {
+            if ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A read-in that panics: searches do not wait forever, and the engine
+    /// rebuilds instead of its apply thread dying.
+    #[test]
+    fn a_panicking_read_in_rebuilds() {
+        let _skips = crate::SKIPS_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        let root = PathBuf::from(format!("/private/tmp/fsearch-engine-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tree/d")).unwrap();
+        std::fs::write(root.join("tree/d/echo-file.txt"), b"x").unwrap();
+        let tree = root.join("tree").canonicalize().unwrap();
+        let (mut skip, mut at) = (Vec::new(), PathBuf::from("/"));
+        for c in tree.components().skip(1) {
+            let next = at.join(c);
+            skip.extend(std::fs::read_dir(&at).unwrap().flatten().map(|e| e.path()).filter(|p| *p != next));
+            at = next;
+        }
+        let home = tree.to_string_lossy().to_string();
+        let opts = || Options {
+            dir: root.join("index"),
+            home: home.clone(),
+            skip: Some(skip.clone()),
+            skip_names: Vec::new(),
+            keep: Vec::new(),
+            content: false,
+        };
+        let q = Query::parse("echo-file.txt", &home).unwrap();
+        let found = |e: &Engine| e.search(&q).is_ok_and(|v| v.iter().any(|f| f.path.ends_with("d/echo-file.txt")));
+        let unlocked = || {
+            let f = std::fs::File::open(root.join("index/daemon.lock")).unwrap();
+            wait(|| f.try_lock().is_ok())
+        };
+        let e = Engine::start(opts()).unwrap();
+        assert!(wait(|| found(&e)), "first crawl");
+        e.stop();
+        drop(e);
+        assert!(unlocked());
+        FAIL_READ_IN.store(true, Ordering::SeqCst);
+        let e = Engine::start(opts()).unwrap();
+        let ready = wait(|| e.status().ready);
+        FAIL_READ_IN.store(false, Ordering::SeqCst);
+        assert!(ready, "not ready after a failed read-in");
+        assert!(found(&e));
+        e.stop();
+        drop(e);
+        assert!(unlocked());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

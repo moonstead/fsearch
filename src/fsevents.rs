@@ -48,6 +48,7 @@ struct Api {
     string: unsafe extern "C" fn(*const c_void, *const i8, u32) -> *const c_void,
     array: unsafe extern "C" fn(*const c_void, *const *const c_void, isize, *const c_void) -> *const c_void,
     array_callbacks: *const c_void,
+    cf_release: unsafe extern "C" fn(*const c_void),
 }
 
 // Function pointers and a constant's address: fine to share.
@@ -77,6 +78,7 @@ fn api() -> &'static Api {
             string: sym(cf, c"CFStringCreateWithCString"),
             array: sym(cf, c"CFArrayCreate"),
             array_callbacks: sym(cf, c"kCFTypeArrayCallBacks"),
+            cf_release: sym(cf, c"CFRelease"),
         }
     })
 }
@@ -97,6 +99,30 @@ pub fn current_id() -> u64 {
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
     fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, relative_priority: i32) -> *const c_void;
+    fn dispatch_release(object: *mut c_void);
+}
+
+/// The context's release callback: FSEvents calls it once, when it frees
+/// the stream, so no callback can still be using the `Info`.
+extern "C" fn release_info(info: *const c_void) {
+    let info = unsafe { Box::from_raw(info as *mut Info) };
+    #[cfg(test)]
+    RELEASED.lock().unwrap().push(info.stream);
+    drop(info);
+}
+
+/// The stream numbers of the contexts `release_info` freed, and of every
+/// context dropped, however (tests count their own streams' entries).
+#[cfg(test)]
+static RELEASED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static INFO_FREED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl Drop for Info {
+    fn drop(&mut self) {
+        INFO_FREED.lock().unwrap().push(self.stream);
+    }
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
@@ -111,7 +137,11 @@ extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mu
 }
 
 /// A running stream; dropping it stops it.
-pub struct Stream(*mut c_void);
+pub struct Stream {
+    stream: *mut c_void,
+    /// Its serial callback queue.
+    queue: *mut c_void,
+}
 
 // The stream is only started and stopped, never shared mid-call.
 unsafe impl Send for Stream {}
@@ -121,9 +151,12 @@ impl Drop for Stream {
     fn drop(&mut self) {
         unsafe {
             let a = api();
-            (a.stop)(self.0);
-            (a.invalidate)(self.0);
-            (a.release)(self.0);
+            (a.stop)(self.stream);
+            (a.invalidate)(self.stream);
+            // The context goes when FSEvents frees the stream (`release_info`).
+            (a.release)(self.stream);
+            // Work still queued keeps the queue alive until it has run.
+            dispatch_release(self.queue);
         }
     }
 }
@@ -135,18 +168,22 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> S
     unsafe {
         let root = (a.string)(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
         let arr = (a.array)(std::ptr::null(), &root, 1, a.array_callbacks);
-        // The sender is leaked: a callback may still be in flight when the
-        // stream stops, and streams are replaced rarely.
+        // Freed by FSEvents through `release_info`.
+        let info = Box::into_raw(Box::new(Info { tx, stream }));
+        let release: extern "C" fn(*const c_void) = release_info;
         let ctx = Context {
             version: 0,
-            info: Box::into_raw(Box::new(Info { tx, stream })) as *mut c_void,
+            info: info as *mut c_void,
             retain: std::ptr::null(),
-            release: std::ptr::null(),
+            release: release as *const c_void,
             copy_description: std::ptr::null(),
         };
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
         let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
+        // The stream keeps its own copy of the paths.
+        (a.cf_release)(arr);
+        (a.cf_release)(root);
         // The callback only copies paths out, but it must not queue behind
         // busy threads (a first build runs on every core at user-initiated
         // QoS): fseventsd drops what a client falls behind on, and the drop
@@ -155,6 +192,60 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> S
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
         (a.start)(s);
-        Stream(s)
+        Stream { stream: s, queue: q }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+    use std::time::{Duration, Instant};
+
+    /// For the streams numbered in `r`: how many contexts the release
+    /// callback freed and how many were freed at all, once all `r.len()` of
+    /// each are in (or 20 s passed), and a little longer to see any freed
+    /// twice. Other tests' engines start streams too, numbered below these.
+    fn freed(r: Range<u32>) -> (usize, usize) {
+        let count = |v: &std::sync::Mutex<Vec<u32>>| v.lock().unwrap().iter().filter(|s| r.contains(s)).count();
+        let now = || (count(&RELEASED), count(&INFO_FREED));
+        let n = r.len();
+        let t = Instant::now();
+        while now() != (n, n) && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        now()
+    }
+
+    /// Each dropped stream's context is freed once, by FSEvents through the
+    /// context's release callback.
+    #[test]
+    fn dropped_streams_free_their_context_through_the_release_callback() {
+        let streams = 1_000_000..1_000_050;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        for k in streams.clone() {
+            drop(watch(current_id(), 0.1, tx.clone(), k));
+        }
+        assert_eq!(freed(streams), (50, 50), "(by the release callback, freed)");
+    }
+
+    /// Streams dropped while their callbacks are busy replaying history:
+    /// each context is still freed exactly once, by the release callback.
+    #[test]
+    fn streams_dropped_mid_replay_free_their_context_once() {
+        let streams = 2_000_000..2_000_030;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let since = current_id().saturating_sub(20_000);
+        let mut mid_replay = 0;
+        for k in streams.clone() {
+            let s = watch(since, 0.0, tx.clone(), k);
+            // Drop it as soon as its first batch is in: more are on the way.
+            mid_replay += rx.recv_timeout(Duration::from_secs(2)).is_ok() as usize;
+            drop(s);
+            rx.try_iter().for_each(drop);
+        }
+        assert_eq!(freed(streams), (30, 30), "(by the release callback, freed)");
+        assert!(mid_replay >= 25, "only {mid_replay} of 30 streams were dropped mid-replay");
     }
 }

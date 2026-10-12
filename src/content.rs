@@ -136,10 +136,12 @@ enum S {
 }
 const NS: usize = 22;
 
+/// Section lengths; None if they do not fit in a usize.
 #[rustfmt::skip]
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, nlong: usize) -> [usize; NS] {
-    let (d, c) = (ndocs * 4, nown * 4);
-    [ntri * 4, (ntri + 1) * 4, plen, d + 4, paths_len, ndocs * 8, d, d, ndocs, d, d, d, d, d, c, c, c * 4, c, c + 4, nwords * 8, c + 4, nlong * 8]
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, nlong: usize) -> Option<[usize; NS]> {
+    let (d, c) = (ndocs.checked_mul(4)?, nown.checked_mul(4)?);
+    let (d1, c1, c4) = (d.checked_add(4)?, c.checked_add(4)?, c.checked_mul(4)?);
+    Some([ntri.checked_mul(4)?, ntri.checked_add(1)?.checked_mul(4)?, plen, d1, paths_len, ndocs.checked_mul(8)?, d, d, ndocs, d, d, d, d, d, c, c, c4, c, c1, nwords.checked_mul(8)?, c1, nlong.checked_mul(8)?])
 }
 
 impl Segment {
@@ -312,8 +314,13 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = std::sync::Arc::new(unsafe { Mmap::map(&f) }.ok()?);
-        let [ndocs, ntri, plen, paths_len, nwords, nown, nlong] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nown, nlong));
+        let counts: [u64; 7] = fields(&map, MAGIC)?;
+        // Every count and offset is stored as a u32 somewhere.
+        if counts.iter().any(|&v| v > u32::MAX as u64) {
+            return None;
+        }
+        let [ndocs, ntri, plen, paths_len, nwords, nown, nlong] = counts.map(|v| v as usize);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nown, nlong)?)?;
         if map.len() < total {
             return None;
         }
@@ -329,6 +336,9 @@ impl Segment {
             map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, nlong, nown, nown1: nown + 1, nown2: nown * 2,
             off, dead, live_docs, refs: Counts::new(nown), runs: Vec::new(),
         };
+        if !s.valid() {
+            return None;
+        }
         let mut runs: Vec<(u32, u32, u32)> = Vec::new();
         for (c, &g) in s.own_gid().iter().enumerate() {
             match runs.last_mut() {
@@ -338,6 +348,26 @@ impl Segment {
         }
         s.runs = runs;
         Some(s)
+    }
+
+    /// Whether the tables hold together as `write_segment` lays them out:
+    /// offsets in order and ending at their section, doc and content ids in
+    /// range. `Held::find` reads `by_hash` ids without bounds checks.
+    fn valid(&self) -> bool {
+        let offsets = |o: &[u32], mask: u32, end: usize| {
+            o.first().map(|&x| x & mask) == Some(0) && o.last().map(|&x| x as usize) == Some(end) && o.windows(2).all(|w| w[0] & mask <= w[1] & mask)
+        };
+        let below = |v: &[u32], n: usize| v.iter().all(|&x| (x as usize) < n);
+        let (nd, no) = (self.ndocs, self.nown);
+        offsets(self.tri_off(), !FLAGS, self.plen)
+            && offsets(self.path_off(), u32::MAX, self.paths_len)
+            && offsets(self.bloom_off(), u32::MAX, self.nwords)
+            && offsets(self.long_off(), u32::MAX, self.nlong)
+            && below(self.by_path(), nd)
+            && below(self.by_rank(), nd)
+            && below(self.by_gid(), nd)
+            && self.own_doc().iter().all(|&d| d == NONE || (d as usize) < nd)
+            && below(self.by_hash(), no)
     }
 
     fn save_dead(&self, dir: &Path) {
@@ -562,6 +592,8 @@ struct Held {
 }
 
 impl Held {
+    // Reads unchecked: `Segment::load` checked every `by_hash` id is below
+    // `nown`, and the layout that the sections lie inside the map.
     fn find(&self, h: [u64; 2]) -> Option<u32> {
         let at = |s: S, k: usize| unsafe { (self.map.as_ptr().add(self.off[s as usize]) as *const u32).add(k).read() };
         let hash = |c: u32| unsafe {
@@ -1006,7 +1038,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         long_off.push(longs.len() as u32);
     }
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown, longs.len()));
+    let (off, _) = lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown, longs.len()).and_then(|l| layout(&l)).expect("segment size");
     let fields = [ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown, longs.len()].map(|v| v as u64);
     let hdr = header(MAGIC, &fields);
     let sections: [&[u8]; NS] = [
@@ -1201,12 +1233,22 @@ fn content_of(gids: &[(u32, u32, u32, u32)], g: u32) -> Option<(usize, u32)> {
 }
 
 impl Content {
+    /// No content index: an engine that searches names only reads nothing
+    /// in `dir`.
+    pub fn none(dir: PathBuf) -> Content {
+        Content::with(dir, Vec::new())
+    }
+
     /// Open the segments the manifest lists, without touching anything: the
     /// view of an engine that follows another process's index.
     pub fn open_shared(dir: PathBuf) -> Content {
         let manifest: Vec<u64> =
             std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
         let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
+        Content::with(dir, segs)
+    }
+
+    fn with(dir: PathBuf, segs: Vec<Segment>) -> Content {
         let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         #[rustfmt::skip]
         let mut c = Content { dir, segs, next_id, gids: Vec::new(), base: Vec::new(), blocks: Vec::new(), copies: Vec::new(), users: Vec::new(), sources: Vec::new() };
@@ -2094,9 +2136,13 @@ struct Lanes {
     n: usize,
     next: std::sync::atomic::AtomicUsize,
     done: std::sync::atomic::AtomicUsize,
-    panicked: std::sync::atomic::AtomicBool,
+    /// Panics of lanes, kept rather than dropped where they are caught: a
+    /// payload's destructor may panic too, and must not run (or unwind)
+    /// before every lane is done with the job. `run_lanes` takes them.
+    panics: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
     /// The search's job, its lifetime erased: it is only run for a lane
-    /// claimed below `n`, and `run_lanes` returns after all of those end.
+    /// claimed below `n`, and `run_lanes` returns (or unwinds) only after
+    /// all of those end (`Drain`).
     job: *const (dyn Fn() + Sync),
 }
 
@@ -2108,11 +2154,35 @@ impl Lanes {
     fn work(&self) {
         use std::sync::atomic::Ordering::*;
         while self.next.fetch_add(1, Relaxed) < self.n {
+            // Counts the lane done however this pass ends, after the job.
+            let _done = LaneDone(self);
             let job = std::panic::AssertUnwindSafe(|| unsafe { (*self.job)() });
-            if std::panic::catch_unwind(job).is_err() {
-                self.panicked.store(true, Relaxed);
+            if let Err(p) = std::panic::catch_unwind(job) {
+                self.panics.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(p);
             }
-            self.done.fetch_add(1, Release);
+        }
+    }
+}
+
+struct LaneDone<'a>(&'a Lanes);
+
+impl Drop for LaneDone<'_> {
+    fn drop(&mut self) {
+        self.0.done.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Closes the lanes and waits for every claimed one to end when dropped:
+/// `run_lanes` cannot return or unwind while a lane may still run the job.
+struct Drain<'a>(&'a Lanes);
+
+impl Drop for Drain<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::*;
+        // From here no lane can be claimed; the ones claimed before count.
+        let claimed = self.0.next.swap(usize::MAX / 2, AcqRel).min(self.0.n);
+        while self.0.done.load(Acquire) < claimed {
+            std::thread::yield_now();
         }
     }
 }
@@ -2162,28 +2232,35 @@ fn helpers() -> &'static Helpers {
 /// this never waits on a helper still waking up (~0.1 ms when they sleep):
 /// one that wakes late finds no lane left.
 fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+    use std::sync::atomic::AtomicUsize;
     if n <= 1 {
         return job();
     }
     let h = helpers();
     let job: *const (dyn Fn() + Sync + '_) = job;
-    // Safety: see `Lanes::job`; the wait below is what makes it hold.
+    // Safety: see `Lanes::job`; `Drain` is what makes it hold.
     let job: *const (dyn Fn() + Sync + 'static) = unsafe { std::mem::transmute(job) };
-    let lanes = std::sync::Arc::new(Lanes { n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panicked: AtomicBool::new(false), job });
+    let lanes = std::sync::Arc::new(Lanes { n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panics: Default::default(), job });
     {
-        let mut g = h.latest.lock().unwrap();
-        g.0 += 1;
-        g.1 = Some(lanes.clone());
+        let drain = Drain(&lanes);
+        {
+            let mut g = h.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.0 += 1;
+            g.1 = Some(lanes.clone());
+        }
+        for _ in 1..n {
+            h.bell.notify_one();
+        }
+        lanes.work();
+        drop(drain);
     }
-    for _ in 1..n {
-        h.bell.notify_one();
+    // Every lane is done: pass the first panic on. The others are leaked,
+    // not dropped, since their destructors could panic while it unwinds.
+    let mut panics = std::mem::take(&mut *lanes.panics.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter();
+    if let Some(first) = panics.next() {
+        panics.for_each(std::mem::forget);
+        std::panic::resume_unwind(first);
     }
-    lanes.work();
-    while lanes.done.load(Acquire) < n {
-        std::thread::yield_now();
-    }
-    assert!(!lanes.panicked.load(Relaxed), "a search lane panicked");
 }
 
 /// Take the `FIRST` best-ranked candidates out of the segments', in order.
@@ -2378,14 +2455,19 @@ fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
         fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
         fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
-    let prior = unsafe { getiopolicy_np(3, 1) };
-    crate::no_materialize();
-    let r = f();
-    if prior >= 0 {
-        unsafe { setiopolicy_np(3, 1, prior) };
+    /// Puts the thread's policy back however `f` ends, a panic included.
+    struct Restore(i32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe { setiopolicy_np(3, 1, self.0) };
+            }
+        }
     }
-    r
+    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
+    let _restore = Restore(unsafe { getiopolicy_np(3, 1) });
+    crate::no_materialize();
+    f()
 }
 
 pub struct FileMatches {
@@ -3159,4 +3241,106 @@ fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
     let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
     unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
     Some(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn every_lane_runs_once() {
+        let calls = AtomicUsize::new(0);
+        run_lanes(8, &|| {
+            calls.fetch_add(1, SeqCst);
+        });
+        assert_eq!(calls.load(SeqCst), 8);
+    }
+
+    #[test]
+    fn a_lane_panic_waits_for_every_lane_and_passes_on() {
+        let (calls, ended) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_lanes(8, &|| {
+                if calls.fetch_add(1, SeqCst) == 0 {
+                    std::panic::panic_any("lane 0 panics");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                ended.fetch_add(1, SeqCst);
+            })
+        }));
+        assert_eq!(r.err().and_then(|p| p.downcast::<&str>().ok()).map(|s| *s), Some("lane 0 panics"));
+        assert_eq!((calls.load(SeqCst), ended.load(SeqCst)), (8, 7));
+    }
+
+    /// A panic payload whose destructor panics too must not let `run_lanes`
+    /// return while other lanes still run the job (its borrows would end).
+    /// Static state, so a failure here cannot touch freed memory.
+    #[test]
+    fn a_panicking_payload_destructor_still_waits_for_every_lane() {
+        thread_local! { static CALLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        static CALLER_LANES: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        struct BadDrop;
+        impl Drop for BadDrop {
+            fn drop(&mut self) {
+                DROPPED.store(true, SeqCst);
+                panic!("payload destructor panics");
+            }
+        }
+        fn job() {
+            if CALLER.with(|c| c.get()) {
+                // Let a helper start first, so one is running when this panics.
+                let t = Instant::now();
+                while STARTED.load(SeqCst) == 0 && t.elapsed() < Duration::from_secs(2) {
+                    std::thread::yield_now();
+                }
+                CALLER_LANES.fetch_add(1, SeqCst);
+                std::panic::panic_any(BadDrop);
+            }
+            STARTED.fetch_add(1, SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            DONE.fetch_add(1, SeqCst);
+        }
+        static JOB: fn() = job;
+        CALLER.with(|c| c.set(true));
+        let r = std::panic::catch_unwind(|| run_lanes(64, &JOB));
+        CALLER.with(|c| c.set(false));
+        let at_return = (STARTED.load(SeqCst), DONE.load(SeqCst));
+        // Whatever came out, its destructor is not run here.
+        if let Err(p) = r {
+            std::mem::forget(p);
+        } else {
+            panic!("run_lanes returned normally");
+        }
+        // Let any lane still running finish before judging (static job).
+        let t = Instant::now();
+        while DONE.load(SeqCst) + CALLER_LANES.load(SeqCst) < 64 && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(at_return.0, at_return.1, "returned while {} lanes still ran", at_return.0 - at_return.1);
+        assert_eq!(at_return.1 + CALLER_LANES.load(SeqCst), 64, "lanes not all done at return");
+        assert!(!DROPPED.load(SeqCst), "a payload was dropped inside run_lanes");
+    }
+
+    unsafe extern "C" {
+        fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    }
+
+    #[test]
+    fn the_io_policy_comes_back_on_return_and_on_unwind() {
+        let original = unsafe { getiopolicy_np(3, 1) };
+        assert_eq!(unsafe { setiopolicy_np(3, 1, 0) }, 0);
+        without_materializing(|| assert_eq!(unsafe { getiopolicy_np(3, 1) }, 1));
+        let after_return = unsafe { getiopolicy_np(3, 1) };
+        let r = std::panic::catch_unwind(|| without_materializing(|| panic!("search panics")));
+        let after_unwind = unsafe { getiopolicy_np(3, 1) };
+        unsafe { setiopolicy_np(3, 1, original) };
+        assert!(r.is_err());
+        assert_eq!((after_return, after_unwind), (0, 0));
+    }
 }

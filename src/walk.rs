@@ -358,6 +358,7 @@ mod tests {
 
     #[test]
     fn kept_folders_and_the_way_to_them_are_never_blocked() {
+        let _skips = crate::SKIPS_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
         *super::SKIP.write().unwrap() = vec![b"/opt".to_vec()];
         *super::SKIP_NAMES.write().unwrap() = vec![b"build".to_vec()];
         *super::KEEP.write().unwrap() = vec![b"/opt/tools/share".to_vec(), b"/Users/a/app/build".to_vec()];

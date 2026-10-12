@@ -494,7 +494,7 @@ impl Index {
 
         // Write the blob, freeing each array once its last reader is done:
         // the build's peak is here, the blob beside the arrays it copies.
-        let (off, total) = layout(&section_lens(n, d, u, unames.len()));
+        let (off, total) = section_lens(n, d, u, unames.len()).and_then(|l| layout(&l)).expect("index size");
         let mut m = MmapMut::map_anon(total).expect("anon map");
         let mut put = |s: Sec, v: &[u8]| m[off[s as usize]..][..v.len()].copy_from_slice(v);
         put(Sec::NameBits, as_bytes(&ubits));
@@ -535,17 +535,28 @@ impl Index {
         put(Sec::NameExt, &slots);
         put(Sec::Exts, as_bytes(&table));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
-        Index::from_map(m.make_read_only().unwrap()).unwrap()
+        Index::from_map(m.make_read_only().unwrap()).expect("built index")
     }
 
-    fn from_map(map: Mmap) -> Option<Index> {
-        let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&section_lens(n, d, u, names_len));
-        let words = u.div_ceil(64);
-        if map.len() < total {
-            return None;
+    /// The index in `map`, its header and layout checked: every section lies
+    /// inside the map, so the typed views are sound. The tables themselves
+    /// are only checked by `check`.
+    fn from_map(map: Mmap) -> Result<Index, &'static str> {
+        let [n, d, u, names_len, event_id, synced_at] = fields::<6>(&map, MAGIC).ok_or("not an index")?;
+        // Entry, folder, name and name-byte positions are stored as u32; the
+        // root is entry 0 and folder 0, and every name is some entry's.
+        let max = u32::MAX as u64;
+        if n == 0 || d == 0 || d > n || u == 0 || u > n || n > max || names_len > max || synced_at > max {
+            return Err("header counts");
         }
-        Some(Index {
+        let (n, d, u, names_len) = (n as usize, d as usize, u as usize, names_len as usize);
+        let (off, total) = section_lens(n, d, u, names_len).and_then(|l| layout(&l)).ok_or("header counts")?;
+        // Exactly as written: a shorter or longer file is not this index.
+        if map.len() != total {
+            return Err("file size");
+        }
+        let words = u.div_ceil(64);
+        Ok(Index {
             n,
             d,
             u,
@@ -555,7 +566,7 @@ impl Index {
             bits_len: words * NBITMAPS,
             zones_len: n.div_ceil(ZONE),
             ext_slots: 256,
-            event_id: event_id as u64,
+            event_id,
             synced_at: synced_at as u32,
             off,
             map,
@@ -584,9 +595,82 @@ impl Index {
         fields::<6>(&h, MAGIC).map(|f| f[4])
     }
 
+    /// A saved index, checked whole (see `check`); None if it is missing or
+    /// unusable.
     pub fn load(path: &Path) -> Option<Index> {
-        let f = std::fs::File::open(path).ok()?;
-        Index::from_map(unsafe { Mmap::map(&f) }.ok()?)
+        Index::load_checked(path).ok()
+    }
+
+    /// `load`, saying why a saved index is unusable.
+    pub fn load_checked(path: &Path) -> Result<Index, &'static str> {
+        let idx = Index::map_saved(path)?;
+        idx.check()?;
+        Ok(idx)
+    }
+
+    /// A saved index with its header and layout checked but not its tables:
+    /// call `check` before using it (the engine does, on its loading thread).
+    pub fn map_saved(path: &Path) -> Result<Index, &'static str> {
+        let f = std::fs::File::open(path).map_err(|_| "missing")?;
+        // Safety: the file is ours, replaced only by atomic rename (`save`),
+        // which leaves this mapping on the old inode.
+        Index::from_map(unsafe { Mmap::map(&f) }.map_err(|_| "unreadable")?)
+    }
+
+    /// Whether the tables hold together as `build` lays them out: every id
+    /// in range, offsets in order, and the folder blocks a tree. Searches
+    /// index with these values directly (a bad id panics, a bad tree can
+    /// loop or split ranges wrongly), so a saved index is checked once.
+    pub fn check(&self) -> Result<(), &'static str> {
+        let (n, d, u) = (self.n, self.d, self.u);
+        let ok = |good: bool, why: &'static str| if good { Ok(()) } else { Err(why) };
+        // Offsets: from 0, in order, ending at the section they index.
+        let offsets =
+            |o: &[u32], end: usize| o.first() == Some(&0) && o.last().map(|&x| x as usize) == Some(end) && o.windows(2).all(|w| w[0] <= w[1]);
+        ok(offsets(self.name_off(), self.names_len), "name offsets")?;
+        // Name bitmaps: nothing past the last name. A search turns a set bit
+        // into a name id and reads that name's offsets.
+        let tail = u % 64;
+        ok(tail == 0 || (0..NBITMAPS).all(|b| self.bitmap(b)[self.words - 1] >> tail == 0), "name bitmaps")?;
+        let (en, parent) = (self.ent_name(), self.parent());
+        ok(en.par_iter().all(|&k| (k as usize) < u), "entry names")?;
+        ok(parent[0] == 0 && parent.par_iter().all(|&p| (p as usize) < d), "entry folders")?;
+        // Folders: entry ids ascending from the root's 0.
+        let (de, dp) = (self.dir_entry(), self.dir_parent());
+        ok(de[0] == 0 && de.windows(2).all(|w| w[0] < w[1]) && (de[d - 1] as usize) < n, "folder entries")?;
+        // Each folder's parent comes before it and holds its entry.
+        ok(dp[0] == 0 && (1..d).all(|k| (dp[k] as usize) < k && parent[de[k] as usize] == dp[k]), "folder parents")?;
+        // Blocks of children inside their subtree range, inside the index;
+        // the root's block starts right after it and its subtree is all.
+        let (ds, dl, dend) = (self.dir_start(), self.dir_len(), self.dir_end());
+        let block_end = |k: usize| ds[k] as usize + dl[k] as usize;
+        ok((0..d).all(|k| ds[k] >= 1 && block_end(k) <= dend[k] as usize && dend[k] as usize <= n), "folder blocks")?;
+        ok(ds[0] == 1 && dend[0] as usize == n && dl.iter().map(|&l| l as usize).sum::<usize>() == n - 1, "folder blocks")?;
+        // Every entry in its folder's block (with the sum above: the blocks
+        // tile the entries, none shared).
+        ok(
+            (1..n).into_par_iter().all(|i| (ds[parent[i] as usize] as usize..block_end(parent[i] as usize)).contains(&i)),
+            "entries outside their folder",
+        )?;
+        // Subtrees nest: a folder's subtree lies in its parent's, after the
+        // parent's block and the subtrees of the siblings before it.
+        let mut free: Vec<usize> = (0..d).map(block_end).collect();
+        for k in 1..d {
+            let p = dp[k] as usize;
+            ok(ds[k] as usize >= free[p] && dend[k] <= dend[p], "folder subtrees")?;
+            free[p] = dend[k] as usize;
+        }
+        // Each name's entries: in range and carrying that name.
+        let (neo, ne) = (self.name_ents_off(), self.name_ents());
+        ok(offsets(neo, n), "name entries")?;
+        ok(
+            (0..u)
+                .into_par_iter()
+                .all(|k| ne[neo[k] as usize..neo[k + 1] as usize].iter().all(|&e| (e as usize) < n && en[e as usize] as usize == k)),
+            "name entries",
+        )?;
+        ok(self.ext_table().iter().all(|e| e[0] <= 15), "extension table")?;
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize {
@@ -632,15 +716,16 @@ pub(crate) fn fields<const N: usize>(b: &[u8], magic: &[u8; 8]) -> Option<[u64; 
     (b.len() >= 8 + N * 8 && &b[..8] == magic).then(|| std::array::from_fn(|k| u64::from_le_bytes(b[8 + k * 8..16 + k * 8].try_into().unwrap())))
 }
 
-/// Section offsets for these lengths, and the file size.
-pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> ([usize; N], usize) {
+/// Section offsets for these lengths, and the file size; None if it does
+/// not fit in a usize.
+pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> Option<([usize; N], usize)> {
     let mut off = [0usize; N];
     let mut at = HDR;
     for (k, &l) in lens.iter().enumerate() {
         off[k] = at;
-        at = (at + l + 63) & !63;
+        at = at.checked_add(l)?.checked_add(63)? & !63;
     }
-    (off, at)
+    Some((off, at))
 }
 
 pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -718,10 +803,11 @@ impl NameInfo {
     }
 }
 
-fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
-    let (n4, d4, u4) = (n * 4, d * 4, (u + 1) * 4);
-    let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
-    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, u * 4, u, 256 * 16, z]
+fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> Option<[usize; NSEC]> {
+    let x4 = |v: usize| v.checked_mul(4);
+    let (n4, d4, u4) = (x4(n)?, x4(d)?, x4(u.checked_add(1)?)?);
+    let z = n.div_ceil(ZONE).checked_mul(std::mem::size_of::<Zone>())?;
+    Some([u.div_ceil(64).checked_mul(NBITMAPS * 8)?, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, x4(u)?, u, 256 * 16, z])
 }
 
 /// Entries per `Zone`.
@@ -909,5 +995,242 @@ fn prior_adjust(name: &[u8], depth: u8) -> i32 {
         b"folders" | b"Containers" | b"Group Containers" => -10,
         b"Application Support" => -5,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::walk::{KIND_FILE, RawEnt};
+
+    /// / with a/ (holding c/ and y.txt), b/ and x.txt; b/ holds z.md and c/
+    /// holds w.rs: 4 folders, 8 entries.
+    fn sample() -> Vec<u8> {
+        let listing = |id: u32, ents: &[(&str, u32)]| {
+            let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+            for &(name, child) in ents {
+                let kind = if child == NONE { KIND_FILE } else { KIND_DIR };
+                l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size: 1, mtime: 1, child });
+                l.names.extend_from_slice(name.as_bytes());
+            }
+            l
+        };
+        let ls = vec![
+            listing(0, &[("a", 1), ("b", 2), ("x.txt", NONE)]),
+            listing(1, &[("c", 3), ("y.txt", NONE)]),
+            listing(2, &[("z.md", NONE)]),
+            listing(3, &[("w.rs", NONE)]),
+        ];
+        // The bytes `save` writes: the built map, header included.
+        Index::build(ls, 1, 1, b"/a").map.to_vec()
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/private/tmp/fsearch-index-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Header field `k` (0 n, 1 d, 2 u, 3 names_len, 4 event id, 5 synced_at).
+    fn field(b: &[u8], k: usize) -> u64 {
+        u64::from_le_bytes(b[8 + k * 8..16 + k * 8].try_into().unwrap())
+    }
+
+    fn set_field(b: &mut [u8], k: usize, v: u64) {
+        b[8 + k * 8..16 + k * 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Section offsets, worked out here rather than by the code under test.
+    fn sections(b: &[u8]) -> [usize; NSEC] {
+        let (n, d, u, nl) = (field(b, 0) as usize, field(b, 1) as usize, field(b, 2) as usize, field(b, 3) as usize);
+        let lens = [
+            u.div_ceil(64) * NBITMAPS * 8,
+            (u + 1) * 4,
+            nl,
+            n * 4,
+            n,
+            n * 4,
+            n * 4,
+            n * 4,
+            d * 4,
+            d * 4,
+            d * 4,
+            d * 4,
+            d,
+            d * 4,
+            (u + 1) * 4,
+            n * 4,
+            u,
+            u * 4,
+            u,
+            256 * 16,
+            n.div_ceil(ZONE) * 16,
+        ];
+        let mut off = [0; NSEC];
+        let mut at = HDR;
+        for (k, l) in lens.into_iter().enumerate() {
+            off[k] = at;
+            at = (at + l + 63) & !63;
+        }
+        off
+    }
+
+    fn get32(b: &[u8], s: Sec, k: usize) -> u32 {
+        let at = sections(b)[s as usize] + 4 * k;
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    fn set32(b: &mut [u8], s: Sec, k: usize, v: u32) {
+        let at = sections(b)[s as usize] + 4 * k;
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Whether `Index::load` takes these bytes.
+    fn loads(name: &str, b: &[u8]) -> bool {
+        let dir = scratch(name);
+        std::fs::write(dir.join("index.bin"), b).unwrap();
+        let ok = Index::load(&dir.join("index.bin")).is_some();
+        let _ = std::fs::remove_dir_all(dir);
+        ok
+    }
+
+    fn rejected(name: &str, edit: impl FnOnce(&mut Vec<u8>)) {
+        let mut b = sample();
+        edit(&mut b);
+        assert!(!loads(name, &b), "{name}: a corrupt index was accepted");
+    }
+
+    #[test]
+    fn a_built_index_loads_and_holds_together() {
+        let b = sample();
+        assert_eq!((field(&b, 0), field(&b, 1), field(&b, 2)), (8, 4, 8));
+        let dir = scratch("valid");
+        std::fs::write(dir.join("index.bin"), &b).unwrap();
+        let idx = Index::load(&dir.join("index.bin")).expect("valid index");
+        let _ = std::fs::remove_dir_all(dir);
+        idx.prefault();
+        let mut path = Vec::new();
+        let e = idx.lookup(b"/a/c/w.rs").expect("lookup");
+        idx.path(e as usize, &mut path);
+        assert_eq!(path, b"/a/c/w.rs");
+    }
+
+    #[test]
+    fn rejects_short_and_long_files() {
+        rejected("empty", |b| b.clear());
+        rejected("header-only-magic", |b| b.truncate(40));
+        rejected("header-only", |b| b.truncate(HDR));
+        rejected("half", |b| b.truncate(b.len() / 2));
+        rejected("one-byte-short", |b| {
+            b.pop();
+        });
+        rejected("one-block-long", |b| b.extend_from_slice(&[0; 64]));
+        rejected("old-format", |b| b[..8].copy_from_slice(b"FSIDX007"));
+    }
+
+    #[test]
+    fn rejects_oversized_header_fields() {
+        // Zero counts and a names length of 2^64 - 1 in a 16 KiB file: the
+        // length check passes when the arithmetic wraps.
+        let mut b = vec![0u8; 16384];
+        b[..8].copy_from_slice(MAGIC);
+        set_field(&mut b, 3, u64::MAX);
+        assert!(!loads("names-len-max", &b), "names_len 2^64 - 1 accepted");
+        // A name count that wraps the bitmap length.
+        rejected("u-wraps", |b| set_field(b, 2, 1 << 63));
+        rejected("n-max", |b| set_field(b, 0, u64::MAX));
+        rejected("n-past-u32", |b| set_field(b, 0, 1 << 32));
+        rejected("more-folders-than-entries", |b| set_field(b, 1, 9));
+        rejected("more-names-than-entries", |b| set_field(b, 2, 9));
+        rejected("synced-past-u32", |b| set_field(b, 5, 1 << 32));
+    }
+
+    #[test]
+    fn rejects_zero_counts() {
+        rejected("zero-folders", |b| set_field(b, 1, 0));
+        rejected("zero-entries", |b| set_field(b, 0, 0));
+    }
+
+    #[test]
+    fn rejects_bad_name_offsets() {
+        rejected("name-off-past-end", |b| {
+            let end = field(b, 3) as u32;
+            set32(b, Sec::NameOff, 1, end + 1)
+        });
+        rejected("name-off-backwards", |b| {
+            let v = get32(b, Sec::NameOff, 3);
+            set32(b, Sec::NameOff, 2, v + 1)
+        });
+        rejected("name-off-not-from-0", |b| set32(b, Sec::NameOff, 0, 1));
+    }
+
+    #[test]
+    fn rejects_ids_out_of_range() {
+        rejected("entry-name", |b| set32(b, Sec::EntName, 3, 8));
+        rejected("entry-folder", |b| set32(b, Sec::Parent, 3, 4));
+        rejected("folder-entry", |b| set32(b, Sec::DirEntry, 3, 8));
+        rejected("name-entry", |b| set32(b, Sec::NameEnts, 2, 8));
+        rejected("name-entry-wrong-name", |b| {
+            let (x, y) = (get32(b, Sec::NameEnts, 1), get32(b, Sec::NameEnts, 2));
+            set32(b, Sec::NameEnts, 1, y);
+            set32(b, Sec::NameEnts, 2, x)
+        });
+    }
+
+    #[test]
+    fn rejects_cyclic_or_misplaced_folders() {
+        // Folder 3 (c) is its own parent, or a later folder's child.
+        rejected("own-parent", |b| set32(b, Sec::DirParent, 3, 3));
+        rejected("parent-after", |b| set32(b, Sec::DirParent, 1, 3));
+        // Entry tables and folder tables disagree on c's parent.
+        rejected("parents-disagree", |b| set32(b, Sec::DirParent, 3, 2));
+        // a's entry claims to be in c: a cycle through the entry table.
+        rejected("entry-cycle", |b| set32(b, Sec::Parent, 1, 3));
+    }
+
+    #[test]
+    fn rejects_bad_blocks_and_subtrees() {
+        rejected("block-past-end", |b| set32(b, Sec::DirLen, 2, 8));
+        rejected("subtree-past-end", |b| set32(b, Sec::DirEnd, 1, 9));
+        rejected("root-not-whole", |b| set32(b, Sec::DirEnd, 0, 7));
+        rejected("blocks-overlap", |b| {
+            let s = get32(b, Sec::DirStart, 1);
+            set32(b, Sec::DirStart, 2, s)
+        });
+        rejected("child-before-parent-block", |b| set32(b, Sec::DirStart, 3, 1));
+    }
+
+    #[test]
+    fn rejects_zeroed_and_random_bodies() {
+        rejected("zero-body", |b| b[HDR..].iter_mut().for_each(|x| *x = 0));
+        rejected("random-body", |b| {
+            let mut s = 0x9e37_79b9_7f4a_7c15u64;
+            for x in b[HDR..].iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *x = s as u8;
+            }
+        });
+    }
+
+    #[test]
+    fn rejects_bits_past_the_last_name() {
+        // 8 names in one word per bitmap: bit 8 is past the last name.
+        let set = |b: &mut Vec<u8>, bitmap: usize| {
+            let words = (field(b, 2) as usize).div_ceil(64);
+            let at = sections(b)[Sec::NameBits as usize] + 8 * (bitmap * words + words - 1);
+            b[at + 1] |= 1;
+        };
+        rejected("first-bitmap-past-end", |b| set(b, 0));
+        rejected("last-bitmap-past-end", |b| set(b, NBITMAPS - 1));
+    }
+
+    #[test]
+    fn rejects_extension_table_lengths() {
+        rejected("ext-len", |b| {
+            let at = sections(b)[Sec::Exts as usize] + 16;
+            b[at] = 200;
+        });
     }
 }
